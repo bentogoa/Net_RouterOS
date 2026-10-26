@@ -107,11 +107,12 @@ class Client
     protected $registry = null;
 
     /**
-     * Whether to stream future responses.
+     * Stream response words that are above this many bytes.
+     * NULL to disable streaming completely.
      *
-     * @var bool
+     * @var int|null
      */
-    private $_streamingResponses = false;
+    private $_streamingResponses = null;
 
     /**
      * Creates a new instance of a RouterOS API client.
@@ -286,24 +287,45 @@ class Client
         $timeout = null
     ) {
         $request = new Request('/login');
-        $request->send($com);
-        $response = new Response($com, false, $timeout);
         $request->setArgument('name', $username);
         $request->setArgument('password', $password);
-        
+        $oldCharset = $com->getCharset($com::CHARSET_ALL);
+        $com->setCharset(null, $com::CHARSET_ALL);
         $request->verify($com)->send($com);
-
+        $com->setCharset($oldCharset, $com::CHARSET_ALL);
         $response = new Response($com, false, $timeout);
-        if ($response->getType() === Response::TYPE_FINAL) {
-            return null === $response->getProperty('ret');
-        } else {
-            while ($response->getType() !== Response::TYPE_FINAL
-                && $response->getType() !== Response::TYPE_FATAL
-            ) {
-                $response = new Response($com, false, $timeout);
+        if ($response->getType() === Response::TYPE_FINAL
+            && null === $response->getProperty('ret')
+        ) {
+            // version >= 6.43
+            return null === $response->getProperty('message');
+        } elseif ($response->getType() === Response::TYPE_FINAL) {
+            // version < 6.43
+            $request->setArgument('password', '');
+            $request->setArgument(
+                'response',
+                '00' . md5(
+                    chr(0) . $password
+                    . pack(
+                        'H*',
+                        is_string($response->getProperty('ret'))
+                        ? $response->getProperty('ret')
+                        : stream_get_contents($response->getProperty('ret'))
+                    )
+                )
+            );
+            $request->verify($com)->send($com);
+            $response = new Response($com, false, $timeout);
+            if ($response->getType() === Response::TYPE_FINAL) {
+                return null === $response->getProperty('ret');
             }
-            return false;
         }
+        while ($response->getType() !== Response::TYPE_FINAL
+            && $response->getType() !== Response::TYPE_FATAL
+        ) {
+            $response = new Response($com, false, $timeout);
+        }
+        return false;
     }
 
     /**
@@ -315,7 +337,7 @@ class Client
      * {@link Communicator::CHARSET_REMOTE}, and when receiving,
      * {@link Communicator::CHARSET_REMOTE} is converted to
      * {@link Communicator::CHARSET_LOCAL}. Setting NULL to either charset will
-     * disable charset convertion, and data will be both sent and received "as
+     * disable charset conversion, and data will be both sent and received "as
      * is".
      *
      * @param mixed $charset     The charset to set. If $charsetType is
@@ -380,7 +402,7 @@ class Client
     {
         //Error checking
         $tag = $request->getTag();
-        if ('' == $tag) {
+        if ('' === (string)$tag) {
             throw new DataFlowException(
                 'Asynchonous commands must have a tag.',
                 DataFlowException::CODE_TAG_REQUIRED
@@ -640,7 +662,7 @@ class Client
     public function cancelRequest($tag = null)
     {
         $cancelRequest = new Request('/cancel');
-        $hasTag = !('' == $tag);
+        $hasTag = !('' === (string)$tag);
         $hasReg = null !== $this->registry;
         if ($hasReg && !$hasTag) {
             $tags = array_merge(
@@ -696,34 +718,39 @@ class Client
     /**
      * Sets response streaming setting.
      *
-     * Sets whether future responses are streamed. If responses are streamed,
-     * the argument values are returned as streams instead of strings. This is
-     * particularly useful if you expect a response that may contain one or more
-     * very large words.
+     * Sets when future response words are streamed. If a word is streamed,
+     * the property value is returned a stream instead of a string, and
+     * unrecognized words are returned entirely as streams instead of strings.
+     * This is particularly useful if you expect a response that may contain
+     * one or more very large words.
      *
-     * @param bool $streamingResponses Whether to stream future responses.
+     * @param int|null $threshold Threshold after which to stream
+     *     a word. That is, a word less than this length will not be streamed.
+     *     If set to 0, effectively all words are streamed.
+     *     NULL to disable streaming altogether.
      *
-     * @return bool The previous value of the setting.
+     * @return $this The client object.
      *
-     * @see isStreamingResponses()
+     * @see getStreamingResponses()
      */
-    public function setStreamingResponses($streamingResponses)
+    public function setStreamingResponses($threshold)
     {
-        $oldValue = $this->_streamingResponses;
-        $this->_streamingResponses = (bool) $streamingResponses;
-        return $oldValue;
+        $this->_streamingResponses = $threshold === null
+            ? null
+            : (int) $threshold;
+        return $this;
     }
 
     /**
      * Gets response streaming setting.
      *
-     * Gets whether future responses are streamed.
+     * Gets when future response words are streamed.
      *
-     * @return bool The value of the setting.
+     * @return int|null The value of the setting.
      *
      * @see setStreamingResponses()
      */
-    public function isStreamingResponses()
+    public function getStreamingResponses()
     {
         return $this->_streamingResponses;
     }
@@ -815,8 +842,8 @@ class Client
      *     If NULL, wait indefinitely.
      * @param int      $usTimeout Microseconds to add to the waiting time.
      *
+     * @return Response  The dispatched response.
      * @throws SocketException When there's no response within the time limit.
-     * @return Response The dispatched response.
      */
     protected function dispatchNextResponse($sTimeout = 0, $usTimeout = 0)
     {
@@ -839,13 +866,13 @@ class Client
             $this->pendingRequestsCount--;
         }
 
-        if ('' != $tag) {
+        if ('' !== (string)$tag) {
             if ($this->isRequestActive($tag, self::FILTER_CALLBACK)) {
                 if ($this->callbacks[$tag]($response, $this)) {
                     try {
                         $this->cancelRequest($tag);
                     } catch (DataFlowException $e) {
-                        if ($e->getCode() !== DataFlowException::CODE_UNKNOWN_REQUEST
+                        if ($e->getCode() !== $e::CODE_UNKNOWN_REQUEST
                         ) {
                             throw $e;
                         }
