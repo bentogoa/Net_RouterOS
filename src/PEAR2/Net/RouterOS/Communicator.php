@@ -88,6 +88,25 @@ class Communicator
     protected $charsets = array();
 
     /**
+     * Length of next word.
+     *
+     * Length of next word. NULL if no peeking was done.
+     *
+     * @var int|double|null
+     */
+    protected $nextWordLength = null;
+
+    /**
+     * Last state of the word lock.
+     *
+     * Last state of the word lock when using persisntent connections.
+     * Unused by non-persistent connections.
+     *
+     * @var int|false
+     */
+    protected $nextWordLock = false;
+
+    /**
      * The transmitter for the connection.
      *
      * @var T\TcpClient
@@ -111,11 +130,15 @@ class Communicator
      *     Must be one of the PEAR2\Net\Transmitter\NetworkStream::CRYPTO_*
      *     constants. Off by default. RouterOS currently supports only TLS, but
      *     the setting is provided in this fashion for forward compatibility's
-     *     sake. And for the sake of simplicity, if you specify an encryption,
-     *     don't specify a context and your default context uses the value
-     *     "DEFAULT" for ciphers, "ADH" will be automatically added to the list
-     *     of ciphers.
+     *     sake.
      * @param resource|null $context A context for the socket.
+     *     If not set, the default context will be used, and adjusted to use
+     *     "ADH" as the "ciphers" SSL context option if there are no CAs on
+     *     any level and that option has not been explicitly set.
+     *     If that option has been set to "ADH" (explicitly or not),
+     *     the "verify_peer" option will be set to FALSE, unless explicitly
+     *     set otherwise. The "verify_peer_name" option is set to match
+     *     "verify_peer", unless explicitly set otherwise.
      *
      * @see sendWord()
      */
@@ -132,20 +155,58 @@ class Communicator
         if (($context === null) && !$isUnencrypted) {
             $context = stream_context_get_default();
             $opts = stream_context_get_options($context);
-            if (!isset($opts['ssl']['ciphers'])
-                || 'DEFAULT' === $opts['ssl']['ciphers']
+            if (isset($opts['ssl']['verify_peer'])) {
+                $verifyPeer = (bool)$opts['ssl']['verify_peer'];
+            } elseif (isset($opts['ssl']['ciphers'])
+                && 'ADH' === $opts['ssl']['ciphers']
             ) {
-                stream_context_set_option(
-                    $context,
-                    array(
-                        'ssl' => array(
-                            'ciphers' => 'ADH',
-                            'verify_peer' => false,
-                            'verify_peer_name' => false
-                        )
-                    )
-                );
+                $verifyPeer = false;
+            } else {
+                $verifyPeer = isset($opts['ssl']['cafile'])
+                    || isset($opts['ssl']['capath']);
+                if (!$verifyPeer
+                    && function_exists('openssl_get_cert_locations')
+                ) {
+                    $fileCt = array(
+                        'default_cert_file',
+                        'default_cert_file_env',
+                        'ini_cafile'
+                    );
+                    $getenvCt = array(
+                        'default_cert_file_env',
+                        'default_cert_dir_env'
+                    );
+                    foreach (openssl_get_cert_locations() as $ct => $cl) {
+                        if (in_array($ct, $getenvCt, true)) {
+                            $cl = (string) getenv($cl);
+                        }
+                        if ('' === $cl) {
+                            continue;
+                        }
+                        $verifyPeer = in_array($ct, $fileCt)
+                            ? is_file($cl)
+                            : is_dir($cl);
+                        if ($verifyPeer) {
+                            break;
+                        }
+                    }
+                }
             }
+            $newOpts = array(
+                'ssl' => array(
+                    'verify_peer' => $verifyPeer,
+                    'verify_peer_name' => isset(
+                        $opts['ssl']['verify_peer_name']
+                    ) ? (bool)$opts['ssl']['verify_peer_name'] : $verifyPeer
+                )
+            );
+            if (!$verifyPeer && !isset($opts['ssl']['ciphers'])) {
+                $newOpts['ssl']['ciphers'] = 'ADH';
+            }
+            stream_context_set_option(
+                $context,
+                $newOpts
+            );
         }
         // @codeCoverageIgnoreStart
         // The $port is customizable in testing.
@@ -184,16 +245,16 @@ class Communicator
      * function. Depending on the argument given, one of the other functions in
      * the class is invoked and its returned value is returned by this function.
      *
-     * @param string|null $string A string of the word to send, or NULL to get
-     *     the next word as a string.
+     * If one or more arguments are provided, it sends a word with the supplied
+     * word fragments. Otherwise, gets the next word as a string.
      *
-     * @return int|string If a string is provided, returns the number of bytes
+     * @return int|string If arguments are given, returns the number of bytes
      *     sent, otherwise returns the next word as a string.
      */
-    public function __invoke($string = null)
+    public function __invoke()
     {
-        return null === $string ? $this->getNextWord()
-            : $this->sendWord($string);
+        return 0 === func_num_args() ? $this->getNextWord()
+            : call_user_func_array(array($this, 'sendWord'), func_get_args());
     }
 
     /**
@@ -402,7 +463,10 @@ class Communicator
      *
      * Sends a word and automatically encodes its length when doing so.
      *
-     * @param string $word The word to send.
+     * @param string|resource $word     The word to send, as a string
+     * or seekable stream.
+     * @param string|resource $word,... Additional word fragments to be sent
+     * as a single word.
      *
      * @return int The number of bytes sent.
      *
@@ -411,73 +475,71 @@ class Communicator
      */
     public function sendWord($word)
     {
-        if (null !== ($remoteCharset = $this->getCharset(self::CHARSET_REMOTE))
-            && null !== ($localCharset = $this->getCharset(self::CHARSET_LOCAL))
-        ) {
-            $word = iconv(
-                $localCharset,
-                $remoteCharset . '//IGNORE//TRANSLIT',
-                $word
-            );
+        $length = 0;
+        $isCharsetConversionEnabled
+            = null !== ($rCharset = $this->getCharset(self::CHARSET_REMOTE))
+            && null !== ($lCharset = $this->getCharset(self::CHARSET_LOCAL));
+        $wordFragments = array();
+        foreach (func_get_args() as $word) {
+            if (is_string($word)) {
+                if ($isCharsetConversionEnabled) {
+                    $word = iconv(
+                        $lCharset,
+                        $rCharset . '//IGNORE//TRANSLIT',
+                        $word
+                    );
+                }
+                $length += strlen($word);
+            } else {
+                if (!self::isSeekableStream($word)) {
+                    throw new InvalidArgumentException(
+                        'Only seekable streams can be sent.',
+                        InvalidArgumentException::CODE_SEEKABLE_REQUIRED
+                    );
+                }
+                if ($isCharsetConversionEnabled) {
+                    $word = self::iconvStream(
+                        $lCharset,
+                        $rCharset . '//IGNORE//TRANSLIT',
+                        $word
+                    );
+                }
+                flock($word, LOCK_SH);
+                $length += self::seekableStreamLength($word);
+            }
+            $wordFragments[] = $word;
         }
-        $length = strlen($word);
         static::verifyLengthSupport($length);
         if ($this->trans->isPersistent()) {
             $old = $this->trans->lock(T\Stream::DIRECTION_SEND);
-            $bytes = $this->trans->send(self::encodeLength($length) . $word);
+            $bytesSent = $this->_sendWord($length, $wordFragments);
             $this->trans->lock($old, true);
-            return $bytes;
+
+            return $bytesSent;
         }
-        return $this->trans->send(self::encodeLength($length) . $word);
+
+        return $this->_sendWord($length, $wordFragments);
     }
 
     /**
-     * Sends a word based on a stream.
+     * Send the word fragments
      *
-     * Sends a word based on a stream and automatically encodes its length when
-     * doing so. The stream is read from its current position to its end, and
-     * then returned to its current position. Because of those operations, the
-     * supplied stream must be seekable.
-     *
-     * @param string   $prefix A string to prepend before the stream contents.
-     * @param resource $stream The seekable stream to send.
+     * @param int|double          $length        The previously computed
+     *     length of all fragments.
+     * @param (string|resource)[] $wordFragments The fragments to send.
      *
      * @return int The number of bytes sent.
-     *
-     * @see sendWord()
      */
-    public function sendWordFromStream($prefix, $stream)
+    private function _sendWord($length, $wordFragments)
     {
-        if (!self::isSeekableStream($stream)) {
-            throw new InvalidArgumentException(
-                'The stream must be seekable.',
-                InvalidArgumentException::CODE_SEEKABLE_REQUIRED
-            );
+        $bytesSent = $this->trans->send(self::encodeLength($length));
+        foreach ($wordFragments as $fragment) {
+            $bytesSent += $this->trans->send($fragment);
+            if (!is_string($fragment)) {
+                flock($fragment, LOCK_UN);
+            }
         }
-        if (null !== ($remoteCharset = $this->getCharset(self::CHARSET_REMOTE))
-            && null !== ($localCharset = $this->getCharset(self::CHARSET_LOCAL))
-        ) {
-            $prefix = iconv(
-                $localCharset,
-                $remoteCharset . '//IGNORE//TRANSLIT',
-                $prefix
-            );
-            $stream = self::iconvStream(
-                $localCharset,
-                $remoteCharset . '//IGNORE//TRANSLIT',
-                $stream
-            );
-        }
-
-        flock($stream, LOCK_SH);
-        $totalLength = strlen($prefix) + self::seekableStreamLength($stream);
-        static::verifyLengthSupport($totalLength);
-
-        $bytes = $this->trans->send(self::encodeLength($totalLength) . $prefix);
-        $bytes += $this->trans->send($stream);
-
-        flock($stream, LOCK_UN);
-        return $bytes;
+        return $bytesSent;
     }
 
     /**
@@ -488,7 +550,7 @@ class Communicator
      * supports words up to 0xFFFFFFFF in length, so that's the only check
      * performed.
      *
-     * @param int $length The length to verify.
+     * @param int|double $length The length to verify.
      *
      * @return void
      */
@@ -520,21 +582,29 @@ class Communicator
                 null,
                 $length
             );
-        } elseif ($length < 0x80) {
+        }
+        if ($length < 0x80) {
             return chr($length);
-        } elseif ($length < 0x4000) {
+        }
+        if ($length < 0x4000) {
             return pack('n', $length |= 0x8000);
-        } elseif ($length < 0x200000) {
+        }
+        if ($length < 0x200000) {
             $length |= 0xC00000;
             return pack('n', $length >> 8) . chr($length & 0xFF);
-        } elseif ($length < 0x10000000) {
+        }
+        if ($length < 0x10000000) {
             return pack('N', $length |= 0xE0000000);
-        } elseif ($length <= 0xFFFFFFFF) {
+        }
+        if ($length <= 0xFFFFFFFF) {
             return chr(0xF0) . pack('N', $length);
-        } elseif ($length <= 0x7FFFFFFFF) {
-            $length = 'f' . base_convert($length, 10, 16);
-            return chr(hexdec(substr($length, 0, 2))) .
-                pack('N', hexdec(substr($length, 2)));
+        }
+        if ($length <= 0x7FFFFFFFF) {
+            $lengthHex = 'f' . base_convert($length, 10, 16);
+            return chr(/** @scrutinizer ignore-type */ hexdec(
+                    substr($lengthHex, 0, 2)
+                )) .
+                pack('N', hexdec(substr($lengthHex, 2)));
         }
         throw new LengthException(
             'Length must not be above 0x7FFFFFFFF.',
@@ -542,6 +612,29 @@ class Communicator
             null,
             $length
         );
+    }
+
+    /**
+     * Get the length of the next word in queue.
+     *
+     * Get the length of the next word in queue without getting the word.
+     * For pesisntent connections, note that the underlying transmitter will
+     * be locked for receiving until either {@link self::getNextWord()} or
+     * {@link self::getNextWordAsStream()} is called.
+     *
+     * @return int|double
+     */
+    public function getNextWordLength()
+    {
+        if (null === $this->nextWordLength) {
+            if ($this->trans->isPersistent()) {
+                $this->nextWordLock = $this->trans->lock(
+                    T\Stream::DIRECTION_RECEIVE
+                );
+            }
+            $this->nextWordLength = self::decodeLength($this->trans);
+        }
+        return $this->nextWordLength;
     }
 
     /**
@@ -556,19 +649,14 @@ class Communicator
      */
     public function getNextWord()
     {
-        if ($this->trans->isPersistent()) {
-            $old = $this->trans->lock(T\Stream::DIRECTION_RECEIVE);
-            $word = $this->trans->receive(
-                self::decodeLength($this->trans),
-                'word'
-            );
-            $this->trans->lock($old, true);
-        } else {
-            $word = $this->trans->receive(
-                self::decodeLength($this->trans),
-                'word'
-            );
+        $word = $this->trans->receive(
+            $this->getNextWordLength(),
+            'word'
+        );
+        if (false !== $this->nextWordLock) {
+            $this->trans->lock($this->nextWordLock, true);
         }
+        $this->nextWordLength = null;
 
         if (null !== ($remoteCharset = $this->getCharset(self::CHARSET_REMOTE))
             && null !== ($localCharset = $this->getCharset(self::CHARSET_LOCAL))
@@ -605,21 +693,15 @@ class Communicator
             );
         }
 
-        if ($this->trans->isPersistent()) {
-            $old = $this->trans->lock(T\Stream::DIRECTION_RECEIVE);
-            $stream = $this->trans->receiveStream(
-                self::decodeLength($this->trans),
-                $filters,
-                'stream word'
-            );
-            $this->trans->lock($old, true);
-        } else {
-            $stream = $this->trans->receiveStream(
-                self::decodeLength($this->trans),
-                $filters,
-                'stream word'
-            );
+        $stream = $this->trans->receiveStream(
+            $this->getNextWordLength(),
+            $filters,
+            'stream word'
+        );
+        if (false !== $this->nextWordLock) {
+            $this->trans->lock($this->nextWordLock, true);
         }
+        $this->nextWordLength = null;
 
         return $stream;
     }
@@ -635,10 +717,13 @@ class Communicator
      *
      * @return int|double The decoded length.
      *     Is of type "double" only for values above "2 << 31".
+     *
+     * @throws NotSupportedException If the stream contains an unsupported
+     * control byte.
      */
     public static function decodeLength(T\Stream $trans)
     {
-        if ($trans->isPersistent() && $trans instanceof T\TcpClient) {
+        if ($trans instanceof T\TcpClient && $trans->isPersistent()) {
             $old = $trans->lock($trans::DIRECTION_RECEIVE);
             $length = self::_decodeLength($trans);
             $trans->lock($old, true);
@@ -661,6 +746,9 @@ class Communicator
      *
      * @return int|double The decoded length.
      *     Is of type "double" only for values above "2 << 31".
+     *
+     * @throws NotSupportedException If the stream contains an unsupported
+     * control byte.
      */
     private static function _decodeLength(T\Stream $trans)
     {
@@ -668,13 +756,16 @@ class Communicator
         if ($byte & 0x80) {
             if (($byte & 0xC0) === 0x80) {
                 return (($byte & 077) << 8 ) + ord($trans->receive(1));
-            } elseif (($byte & 0xE0) === 0xC0) {
+            }
+            if (($byte & 0xE0) === 0xC0) {
                 $rem = unpack('n~', $trans->receive(2));
                 return (($byte & 037) << 16 ) + $rem['~'];
-            } elseif (($byte & 0xF0) === 0xE0) {
+            }
+            if (($byte & 0xF0) === 0xE0) {
                 $rem = unpack('n~/C~~', $trans->receive(3));
                 return (($byte & 017) << 24 ) + ($rem['~'] << 8) + $rem['~~'];
-            } elseif (($byte & 0xF8) === 0xF0) {
+            }
+            if (($byte & 0xF8) === 0xF0) {
                 $rem = unpack('N~', $trans->receive(4));
                 return (($byte & 007) * 0x100000000/* '<< 32' or '2^32' */)
                     + (double) sprintf('%u', $rem['~']);
