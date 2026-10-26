@@ -47,7 +47,7 @@ class Request extends Message
     /**
      * A query for the command.
      *
-     * @var Query
+     * @var Query|null
      */
     private $_query;
 
@@ -271,6 +271,25 @@ class Request extends Message
     }
 
     /**
+     * Get actionable debug info.
+     *
+     * This is a magic method available to PHP 5.6 and above, due to which
+     * output of var_dump() will be more actionable.
+     *
+     * You can still call it in earlier versions to get the object as a
+     * plain array.
+     *
+     * @return array The info, as an associative array.
+     */
+    public function __debugInfo()
+    {
+        return parent::__debugInfo() + array(
+            'command' => $this->_command,
+            'query' => $this->_query
+        );
+    }
+
+    /**
      * Sends a request over a communicator.
      *
      * @param Communicator  $com The communicator to send the request over.
@@ -329,11 +348,7 @@ class Request extends Message
         }
         foreach ($this->attributes as $name => $value) {
             $prefix = '=' . $name . '=';
-            if (is_string($value)) {
-                $bytes += $com->sendWord($prefix . $value);
-            } else {
-                $bytes += $com->sendWordFromStream($prefix, $value);
-            }
+            $bytes += $com->sendWord($prefix, $value);
         }
         $query = $this->getQuery();
         if ($query instanceof Query) {
@@ -419,7 +434,8 @@ class Request extends Message
                 '/^="(([^\\\"]|\\\"|\\\\)*)"/sS',
                 $string,
                 $matches
-            )) {
+            )
+            ) {
                 $token = $matches[0];
                 $this->setArgument(
                     $name,
@@ -445,6 +461,5 @@ class Request extends Message
         if (null !== $name && ('' !== ($name = trim($name)))) {
             $this->setArgument($name, '');
         }
-
     }
 }
