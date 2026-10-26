@@ -132,7 +132,7 @@ class Util implements Countable
             $menuRequest = new Request('/menu');
             if ('/' === $newMenu) {
                 $this->menu = '';
-            } elseif ('/' === $newMenu[0]) {
+            } elseif (strpos($newMenu, '/') === 0) {
                 $this->menu = $menuRequest->setCommand($newMenu)->getCommand();
             } else {
                 $newMenu = (string)substr(
@@ -407,18 +407,21 @@ class Util implements Countable
      * Finds the IDs of items at the current menu.
      *
      * Finds the IDs of items based on specified criteria, and returns them as
-     * a comma separated string, ready for insertion at a "numbers" argument.
+     * a comma separated list, ready for insertion at a "numbers" argument,
+     * a print's "from" argument, or an equivalent items targeting argument.
      *
      * Accepts zero or more criteria as arguments. If zero arguments are
-     * specified, returns all items' IDs. The value of each criteria can be a
-     * number (just as in Winbox), a literal ID to be included, a {@link Query}
-     * object, or a callback. If a callback is specified, it is called for each
-     * item, with the item as an argument. If it returns a true value, the
-     * item's ID is included in the result. Every other value is casted to a
-     * string. A string is treated as a comma separated values of IDs, numbers
-     * or callback names. Non-existent callback names are instead placed in the
-     * result, which may be useful in menus that accept identifiers other than
-     * IDs, but note that it can cause errors on other menus.
+     * specified, returns all items' IDs. The value of each criteria can be an
+     * integer (a number as in Winbox), a {@link Query} object, or a callback.
+     * Other values (including non existent callback names) are casted to a
+     * string. A string is treated as a comma separated list of IDs or
+     * whatever else the menu can accept as a unique identifier.
+     * Those lists are then normalized (meaning excessive commas are stripped
+     * and trimmed), and appended to the result.
+     *
+     * Callbacks are called for each item, with the item
+     * as an argument. If the callback returns a true value, the item's ID is
+     * included in the result.
      *
      * @return string A comma separated list of all items matching the
      *     specified criteria.
@@ -433,7 +436,9 @@ class Util implements Countable
                 if (null === $ret) {
                     $this->idCache = array();
                     return '';
-                } elseif (!is_string($ret)) {
+                }
+
+                if (!is_string($ret)) {
                     $ret = stream_get_contents($ret);
                 }
 
@@ -450,18 +455,21 @@ class Util implements Countable
         $idList = '';
         foreach (func_get_args() as $criteria) {
             if ($criteria instanceof Query) {
+                /** @var Response $response */
                 foreach ($this->client->sendSync(
                     new Request($this->menu . '/print .proplist=.id', $criteria)
                 )->getAllOfType(Response::TYPE_DATA) as $response) {
                     $newId = $response->getProperty('.id');
-                    $idList .= strtolower(
+                    $newId = strtolower(
                         is_string($newId)
                         ? $newId
-                        : stream_get_contents($newId) . ','
+                        : stream_get_contents($newId)
                     );
+                    $idList .= $newId . ',';
                 }
             } elseif (is_callable($criteria)) {
                 $idCache = array();
+                /** @var Response $response */
                 foreach ($this->client->sendSync(
                     new Request($this->menu . '/print')
                 )->getAllOfType(Response::TYPE_DATA) as $response) {
@@ -477,37 +485,20 @@ class Util implements Countable
                     $idCache[] = $newId;
                 }
                 $this->idCache = $idCache;
-            } else {
+            } elseif (is_int($criteria)) {
                 $this->find();
-                if (is_int($criteria)) {
-                    if (isset($this->idCache[$criteria])) {
-                        $idList = $this->idCache[$criteria] . ',';
-                    }
+                if (isset($this->idCache[$criteria])) {
+                    $idList .= $this->idCache[$criteria] . ',';
+                }
+            } else {
+                $criteria = (string)$criteria;
+                if (false === strpos($criteria, ',')) {
+                    $idList .= $criteria . ',';
                 } else {
-                    $criteria = (string)$criteria;
-                    if ($criteria === (string)(int)$criteria) {
-                        if (isset($this->idCache[(int)$criteria])) {
-                            $idList .= $this->idCache[(int)$criteria] . ',';
-                        }
-                    } elseif (false === strpos($criteria, ',')) {
-                        $idList .= $criteria . ',';
-                    } else {
-                        $criteriaArr = explode(',', $criteria);
-                        for ($i = count($criteriaArr) - 1; $i >= 0; --$i) {
-                            if ('' === $criteriaArr[$i]) {
-                                unset($criteriaArr[$i]);
-                            } elseif ('*' === $criteriaArr[$i][0]) {
-                                $idList .= $criteriaArr[$i] . ',';
-                                unset($criteriaArr[$i]);
-                            }
-                        }
-                        if (!empty($criteriaArr)) {
-                            $idList .= call_user_func_array(
-                                array($this, 'find'),
-                                $criteriaArr
-                            ) . ',';
-                        }
-                    }
+                    $idList .= trim(
+                        preg_replace('/,+/S', ',', $criteria),
+                        ','
+                    ) . ',';
                 }
             }
         }
@@ -534,19 +525,32 @@ class Util implements Countable
      *
      * @throws RouterErrorException When the router returns an error response
      *     (e.g. no such item, invalid property, etc.).
+     *     This exception is also thrown for a query that has no match or
+     *     if $numbers is an int not found in the ID cache, which most often
+     *     happens if there is no such item in the first place.
      */
     public function get($number, $valueName = null)
     {
         if ($number instanceof Query) {
+            /** @noinspection CallableParameterUseCaseInTypeContextInspection */
             $number = explode(',', $this->find($number));
             $number = $number[0];
-        } elseif (is_int($number) || ((string)$number === (string)(int)$number)) {
+            if ('' === $number) {
+                throw new RouterErrorException(
+                    'Query did not match an item',
+                    RouterErrorException::CODE_GET_LOOKUP_ERROR
+                );
+            }
+        } elseif (is_int($number)) {
             $this->find();
-            if (isset($this->idCache[(int)$number])) {
-                $number = $this->idCache[(int)$number];
+            if (isset($this->idCache[$number])) {
+                $number = $this->idCache[$number];
             } else {
                 throw new RouterErrorException(
-                    'Unable to resolve number from ID cache (no such item maybe)',
+                    <<< 'EOT'
+Unable to resolve number from ID cache (no such item maybe)
+EOT
+                    ,
                     RouterErrorException::CODE_CACHE_ERROR
                 );
             }
@@ -761,7 +765,10 @@ class Util implements Countable
     }
 
     /**
-     * Alias of {@link static::set()}
+     * Sets or unsets a value.
+     *
+     * Sets or unsets a value of a single property on all items at the current
+     * menu which match certain criteria.
      *
      * @param mixed                $numbers   Items to be modified.
      *     Can be any criteria accepted by {@link static::find()} or NULL
@@ -821,14 +828,14 @@ class Util implements Countable
     /**
      * Adds a new item at the current menu.
      *
-     * @param array<string,string|resource>|array<int,string> $values Accepts
+     * @param array<string,string|resource>|array<int,string> $values     Accept
      *     one or more items to add to the current menu.
      *     The data about each item is specified as an array with the names of
      *     each property as an array key, and the value as an array value.
      *     Flags (properties with a value "true" that is interpreted as
      *     equivalent of "yes" from CLI) can also be specified with a numeric
      *     index as the array key, and the name of the flag as the array value.
-     * @param array<string,string|resource>|array<int,string> $...    Additional
+     * @param array<string,string|resource>|array<int,string> $values,... More
      *     items.
      *
      * @return string A comma separated list of the new items' IDs.
@@ -979,8 +986,9 @@ class Util implements Countable
      *     The "follow" and "follow-only" arguments are prohibited,
      *     as they would cause a synchronous request to run forever, without
      *     allowing the results to be observed.
-     *     If you need to use those arguments, use {@link static::newRequest()},
-     *     and pass the resulting {@link Request} to {@link Client::sendAsync()}.
+     *     If you need to use those arguments, use
+     *     {@link static::newRequest()}, and pass the resulting {@link Request}
+     *     to {@link Client::sendAsync()}.
      *     The "count-only" argument is also prohibited, as results from it
      *     would not be consumable. Use {@link static::count()} for that.
      * @param Query|null                                      $query A query to
@@ -1110,10 +1118,12 @@ class Util implements Countable
             $fileSize = stream_get_contents($fileSize);
         }
         if (Communicator::isSeekableStream($data)) {
-            return Communicator::seekableStreamLength($data) == $fileSize;
-        } else {
-            return sprintf('%u', strlen((string)$data)) === $fileSize;
+            return (double)$fileSize === Communicator::seekableStreamLength(
+                /** @scrutinizer ignore-type */ $data
+            );
         }
+
+        return sprintf('%u', strlen((string)$data)) === $fileSize;
     }
 
     /**
@@ -1154,7 +1164,9 @@ class Util implements Countable
                 $responses
             );
         } catch (RouterErrorException $e) {
-            if ($e->getCode() !== RouterErrorException::CODE_SCRIPT_RUN_ERROR) {
+            if ($e->getCode() !== RouterErrorException::CODE_SCRIPT_RUN_ERROR
+                || null === $e->getResponses()
+            ) {
                 throw $e;
             }
             $message = $e->getResponses()->getAllOfType(Response::TYPE_ERROR)
